@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 14,
+  "id": 16,
   "links": [],
   "panels": [
     {
@@ -108,7 +108,6 @@
           "datasource": {
             "type": "prometheus",
             "uid": "grafanacloud-prom"
-    
           },
           "expr": "sum(rate(http_requests_total{endpoint=\"/ct/v1/add-chain\"}[1m])) by (status)",
           "legendFormat": "Add Chain {{status}}",
@@ -117,11 +116,26 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
+          "editorMode": "builder",
           "expr": "sum(rate(http_requests_total{endpoint=\"/ct/v1/add-pre-chain\"}[1m])) by (status)",
           "legendFormat": "Add Pre-Chain {{status}}",
+          "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "grafanacloud-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(http_requests_total{status=\"200\", endpoint=\"/ct/v1/add-pre-chain\"}[1m])) + sum(rate(http_requests_total{status=\"200\", endpoint=\"/ct/v1/add-chain\"}[1m]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Total Accepted Submissions (certs + pre-certs 200)",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Write Requests per Second",
@@ -213,7 +227,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
           "editorMode": "code",
           "expr": "sum(rate(http_requests_total{endpoint=~\"/ct/v1/get-.*\"}[1m]))",
@@ -310,19 +324,23 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (endpoint, le))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (endpoint, le))",
           "legendFormat": "p99 {{endpoint}}",
+          "range": true,
           "refId": "A"
         },
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (endpoint, le))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (endpoint, le))",
           "legendFormat": "p95 {{endpoint}}",
+          "range": true,
           "refId": "B"
         }
       ],
@@ -412,9 +430,11 @@
           "datasource": {
             "type": "prometheus",
             "uid": "grafanacloud-prom"
-            },
-          "expr": "sum(rate(deduplicated_certificates_total{type=\"skipped\"}[5m])) / sum(rate(deduplicated_certificates_total{type=\"checked\"}[5m])) * 100",
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(deduplicated_certificates_total{type=\"skipped\"}[1m])) / sum(rate(deduplicated_certificates_total{type=\"checked\"}[1m])) * 100",
           "legendFormat": "Deduplication Rate",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -441,7 +461,7 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "locale"
         },
         "overrides": []
       },
@@ -474,7 +494,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
           "expr": "merkle_tree_size",
           "refId": "A"
@@ -545,7 +565,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
           "expr": "(storage_queue_depth / storage_queue_capacity) * 100",
           "refId": "A"
@@ -608,7 +628,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "grafanacloud-prom"    
+            "uid": "grafanacloud-prom"
           },
           "expr": "sum(increase(certificate_submissions_total[1h])) by (status)",
           "legendFormat": "{{status}}",
@@ -636,5 +656,5 @@
   "timezone": "",
   "title": "CompactLog Metrics",
   "uid": "compact_log-metrics",
-  "version": 15
+  "version": 5
 }
