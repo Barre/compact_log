@@ -1,4 +1,5 @@
 use axum::{
+    extract::Path,
     middleware,
     response::{Json, Response},
     routing::{get, post},
@@ -17,6 +18,7 @@ use crate::{
 };
 
 pub mod handlers;
+pub mod static_handlers;
 
 pub struct ApiState {
     pub storage: Arc<CtStorage>,
@@ -43,7 +45,19 @@ impl ApiState {
             log_id.clone(),
             &private_key,
         )?);
-        let sth_builder = Arc::new(SthBuilder::from_private_key_bytes(&private_key)?);
+
+        // Derive origin from base_url for checkpoints
+        // Remove scheme (http:// or https://) and trailing slashes
+        let origin = base_url
+            .trim_end_matches('/')
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string();
+
+        // Use the actual LogId bytes (which is already the SHA-256 of the public key)
+        let log_id_bytes = log_id.to_bytes().to_vec();
+
+        let sth_builder = Arc::new(SthBuilder::new(&private_key, origin, log_id_bytes)?);
 
         let validator = validator.map(|v| Arc::new(RwLock::new(v)));
 
@@ -62,6 +76,7 @@ impl ApiState {
 
 pub fn create_router(state: ApiState) -> Router {
     Router::new()
+        // RFC 6962 endpoints
         .route("/ct/v1/add-chain", post(handlers::add_chain))
         .route("/ct/v1/add-pre-chain", post(handlers::add_pre_chain))
         .route("/ct/v1/get-sth", get(handlers::get_sth))
@@ -76,9 +91,15 @@ pub fn create_router(state: ApiState) -> Router {
             "/ct/v1/get-entry-and-proof",
             get(handlers::get_entry_and_proof),
         )
-        // Inclusion request endpoint
+        // Static CT API endpoints
+        .route("/checkpoint", get(static_handlers::get_checkpoint))
+        .route("/tile/{level}/{*index}", get(handle_tile_request_with_path))
+        .route(
+            "/tile/data/{*index}",
+            get(handle_data_tile_request_with_path),
+        )
+        .route("/issuer/{fingerprint}", get(static_handlers::get_issuer))
         .route("/inclusion_request.json", get(handlers::inclusion_request))
-        // Health check
         .route("/health", get(health_check))
         // Prometheus metrics endpoint
         .route("/metrics", get(metrics_handler))
@@ -91,6 +112,39 @@ async fn health_check() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+// Handler wrappers for tile routes
+async fn handle_tile_request_with_path(
+    state: axum::extract::State<Arc<ApiState>>,
+    Path((level, index_path)): Path<(u8, String)>,
+) -> Result<Response, (axum::http::StatusCode, axum::Json<ErrorResponse>)> {
+    // Parse the index path which may contain .p/{width}
+    let (index, width) = parse_tile_path(&index_path);
+    static_handlers::get_tile(state, Path((level, index, width))).await
+}
+
+async fn handle_data_tile_request_with_path(
+    state: axum::extract::State<Arc<ApiState>>,
+    Path(index_path): Path<String>,
+) -> Result<Response, (axum::http::StatusCode, axum::Json<ErrorResponse>)> {
+    // Parse the index path which may contain .p/{width}
+    let (index, width) = parse_tile_path(&index_path);
+    static_handlers::get_data_tile(state, Path((index, width))).await
+}
+
+// Helper function to parse tile paths like "x001/x234/067" or "x001/x234/067.p/123"
+fn parse_tile_path(path: &str) -> (String, Option<u16>) {
+    if let Some(dot_p_pos) = path.rfind(".p/") {
+        let index = path[..dot_p_pos].to_string();
+        let width_str = &path[dot_p_pos + 3..];
+        if let Ok(width) = width_str.parse::<u16>() {
+            if width > 0 && width <= 256 {
+                return (index, Some(width));
+            }
+        }
+    }
+    (path.to_string(), None)
 }
 
 #[derive(Serialize)]

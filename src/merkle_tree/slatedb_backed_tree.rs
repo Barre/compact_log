@@ -9,7 +9,7 @@ use digest::Digest;
 use moka::future::Cache;
 use slatedb::{Db, WriteBatch};
 use std::{fmt, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug)]
 pub enum SlateDbTreeError {
@@ -741,6 +741,227 @@ where
         }
 
         self.prove_consistency_between(old_size, new_size).await
+    }
+}
+
+// Separate impl block for methods that need H: Digest constraint
+impl<H, T> SlateDbBackedTree<H, T>
+where
+    H: Digest,
+    T: HashableLeaf + serde::Serialize + serde::de::DeserializeOwned,
+{
+    /// Precompute and store subtree roots for efficient static API tile generation
+    /// This computes subtree roots only for the range of entries specified
+    /// Returns a vector of (key, value) pairs to be included in the batch write
+    pub async fn precompute_tile_subtree_roots_for_range(
+        &self,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, SlateDbTreeError> {
+        let tree_size = self.get_committed_size().await?;
+        if tree_size == 0 || start_index >= end_index {
+            return Ok(vec![]);
+        }
+
+        let mut potential_subtrees = Vec::new();
+
+        for level in 1..=7 {
+            let subtree_size = match 256u64.checked_pow(level as u32) {
+                Some(size) => size,
+                None => break,
+            };
+            let positions_per_tile = 256u64;
+
+            let first_affected_position = start_index / (subtree_size / positions_per_tile);
+            let last_affected_position = (end_index - 1) / (subtree_size / positions_per_tile);
+
+            let first_tile = first_affected_position / positions_per_tile;
+            let last_tile = last_affected_position / positions_per_tile;
+
+            for tile_idx in first_tile..=last_tile {
+                let tile_start = match tile_idx.checked_mul(positions_per_tile) {
+                    Some(start) => start,
+                    None => break,
+                };
+
+                for pos in 0..positions_per_tile {
+                    let leaf_offset = match tile_start.checked_add(pos) {
+                        Some(offset) => offset,
+                        None => break,
+                    };
+
+                    let leaves_per_position = subtree_size / positions_per_tile;
+                    let start_leaf = match leaf_offset.checked_mul(leaves_per_position) {
+                        Some(leaf) => leaf,
+                        None => break,
+                    };
+
+                    let end_leaf = match start_leaf.checked_add(leaves_per_position) {
+                        Some(leaf) => leaf,
+                        None => tree_size,
+                    };
+
+                    if end_leaf <= start_index || start_leaf >= tree_size {
+                        continue;
+                    }
+
+                    if start_leaf < end_index {
+                        let actual_end_leaf = std::cmp::min(end_leaf, tree_size);
+                        let subtree_root_idx =
+                            crate::merkle_tree::compute_subtree_root(start_leaf, actual_end_leaf);
+                        let node_idx = subtree_root_idx.as_u64();
+                        potential_subtrees.push((node_idx, start_leaf, actual_end_leaf));
+                    }
+                }
+            }
+        }
+
+        potential_subtrees.sort_by_key(|(idx, _, _)| *idx);
+        potential_subtrees.dedup_by_key(|(idx, _, _)| *idx);
+
+        let versioned_keys: Vec<Vec<u8>> = potential_subtrees
+            .iter()
+            .map(|(node_idx, _, _)| Self::versioned_node_key(*node_idx, tree_size))
+            .collect();
+
+        let existence_checks =
+            futures::future::join_all(versioned_keys.iter().map(|key| self.db.get(key))).await;
+
+        let nodes_to_compute: Vec<(u64, u64, u64)> = potential_subtrees
+            .into_iter()
+            .zip(existence_checks.iter())
+            .filter_map(|((node_idx, start, end), result)| match result {
+                Ok(None) => Some((node_idx, start, end)),
+                _ => None,
+            })
+            .collect();
+
+        if nodes_to_compute.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut nodes_by_size: std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> =
+            std::collections::BTreeMap::new();
+        for (node_idx, start, end) in nodes_to_compute {
+            let size = end - start;
+            nodes_by_size
+                .entry(size)
+                .or_default()
+                .push((node_idx, start, end));
+        }
+
+        let computed_hashes = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
+        let mut batch_data = Vec::new();
+
+        for (_size, nodes_at_size) in nodes_by_size {
+            let futures: Vec<_> = nodes_at_size
+                .into_iter()
+                .map(|(node_idx, start_leaf, end_leaf)| {
+                    let computed_hashes = computed_hashes.clone();
+
+                    async move {
+                        // Check cache first
+                        {
+                            let cache = computed_hashes.read().await;
+                            if cache.contains_key(&node_idx) {
+                                return Ok(None);
+                            }
+                        }
+
+                        let hash = self
+                            .compute_subtree_root_hash_parallel(
+                                start_leaf,
+                                end_leaf,
+                                tree_size,
+                                &computed_hashes,
+                            )
+                            .await?;
+
+                        // Store in cache
+                        {
+                            let mut cache = computed_hashes.write().await;
+                            cache.insert(node_idx, hash.clone());
+                        }
+
+                        let versioned_key = Self::versioned_node_key(node_idx, tree_size);
+                        let latest_version_key = Self::node_latest_version_key(node_idx);
+
+                        Ok(Some(vec![
+                            (versioned_key, hash.as_ref().to_vec()),
+                            (latest_version_key, tree_size.to_be_bytes().to_vec()),
+                        ]))
+                    }
+                })
+                .collect();
+
+            #[allow(clippy::type_complexity)]
+            let results: Vec<
+                Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, SlateDbTreeError>,
+            > = futures::future::join_all(futures).await;
+
+            for data in results.into_iter().flatten().flatten() {
+                batch_data.extend(data);
+            }
+        }
+
+        Ok(batch_data)
+    }
+
+    /// Parallel version of compute_subtree_root_hash that computes left and right subtrees concurrently
+    async fn compute_subtree_root_hash_parallel(
+        &self,
+        start_leaf: u64,
+        end_leaf: u64,
+        tree_size: u64,
+        cache: &Arc<RwLock<std::collections::BTreeMap<u64, digest::Output<H>>>>,
+    ) -> Result<digest::Output<H>, SlateDbTreeError> {
+        use crate::merkle_tree::ct_merkle_vendored::LeafIdx;
+
+        let size = end_leaf - start_leaf;
+
+        if size == 1 {
+            let leaf_idx: InternalIdx = LeafIdx::new(start_leaf).into();
+            let node_idx = leaf_idx.as_u64();
+
+            {
+                let cache_read = cache.read().await;
+                if let Some(hash) = cache_read.get(&node_idx) {
+                    return Ok(hash.clone());
+                }
+            }
+
+            return self.get_node_hash_at_version(node_idx, tree_size).await;
+        }
+
+        let subtree_root_idx = crate::merkle_tree::compute_subtree_root(start_leaf, end_leaf);
+        let node_idx = subtree_root_idx.as_u64();
+
+        {
+            let cache_read = cache.read().await;
+            if let Some(hash) = cache_read.get(&node_idx) {
+                return Ok(hash.clone());
+            }
+        }
+
+        let k = crate::merkle_tree::consistency::largest_power_of_two_less_than(size);
+
+        let (left_hash, right_hash) = futures::future::try_join(
+            Box::pin(self.compute_subtree_root_hash_parallel(
+                start_leaf,
+                start_leaf + k,
+                tree_size,
+                cache,
+            )),
+            Box::pin(self.compute_subtree_root_hash_parallel(
+                start_leaf + k,
+                end_leaf,
+                tree_size,
+                cache,
+            )),
+        )
+        .await?;
+
+        Ok(parent_hash::<H>(&left_hash, &right_hash))
     }
 }
 

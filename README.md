@@ -6,7 +6,7 @@
 
 # CompactLog
 
-A Certificate Transparency (CT) log implementation. CompactLog implements the RFC 6962 Certificate Transparency API on top of SlateDB to explore how LSM-tree storage can address traditional CT log scalability challenges.
+A dual-API Certificate Transparency (CT) log implementation. CompactLog serves the same Merkle tree through both the RFC 6962 Certificate Transparency API and the Static CT API (C2SP draft), built on SlateDB to explore how LSM-tree storage can address traditional CT log scalability challenges.
 
 ## Overview
 
@@ -15,7 +15,8 @@ This implementation provides a complete Certificate Transparency log that:
 - Accepts X.509 certificate chains and pre-certificates
 - Issues Signed Certificate Timestamps (SCTs)
 - Maintains a cryptographically verifiable Merkle tree
-- Provides inclusion and consistency proofs
+- Provides inclusion and consistency proofs via RFC 6962 API
+- Serves the same tree data through Static CT API (C2SP draft)
 - Stores data in cloud object storage (S3, Azure Blob) or local filesystem
 
 ## Performance Metrics
@@ -206,3 +207,25 @@ RUST_LOG=debug cargo run --release
 ```
 
 The system automatically generates ECDSA P-256 keys and default configuration if not present.
+
+## API Endpoints
+
+CompactLog exposes both RFC 6962 and Static CT API endpoints on the same server:
+
+### RFC 6962 API
+- `POST /ct/v1/add-chain` - Submit certificate chain
+- `POST /ct/v1/add-pre-chain` - Submit pre-certificate chain  
+- `GET /ct/v1/get-sth` - Get signed tree head
+- `GET /ct/v1/get-entries` - Get log entries
+- `GET /ct/v1/get-proof-by-hash` - Get inclusion proof by hash
+- `GET /ct/v1/get-entry-and-proof` - Get entry and inclusion proof
+- `GET /ct/v1/get-sth-consistency` - Get consistency proof
+- `GET /ct/v1/get-roots` - Get accepted root certificates
+
+### Static CT API (C2SP)
+- `GET /checkpoint` - Get current checkpoint (signed note format)
+- `GET /tile/{level}/{index}` - Get Merkle tree tile
+- `GET /tile/data/{index}` - Get data tile (gzip compressed)
+- `GET /issuer/{fingerprint}` - Get issuer certificate by SHA-256 fingerprint
+
+Both APIs serve the exact same Merkle tree data, just in different formats suited to their respective use cases.

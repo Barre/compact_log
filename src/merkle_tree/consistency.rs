@@ -58,7 +58,7 @@ fn subproof_with_offset(m: u64, n: u64, b: bool, offset: u64) -> Vec<u64> {
 }
 
 /// Compute the root of a subtree containing leaves [start, end)
-pub(crate) fn compute_subtree_root(start: u64, end: u64) -> InternalIdx {
+pub fn compute_subtree_root(start: u64, end: u64) -> InternalIdx {
     let size = end - start;
 
     if size == 1 {

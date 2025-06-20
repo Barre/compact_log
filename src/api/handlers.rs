@@ -170,14 +170,22 @@ pub async fn add_chain(
         timestamp,
     );
 
-    let sct = state
-        .sct_builder
-        .create_sct_with_timestamp(&cert_der, LogEntryType::X509Entry, None, timestamp_ms)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(e.into())))?;
+    let sct_builder = state.sct_builder.clone();
+    let cert_der_for_sct = cert_der.clone();
 
-    let _assigned_index = state
+    let (_assigned_index, sct) = state
         .storage
-        .add_entry_batched(log_entry, cert_hash, sct.clone())
+        .add_entry_batched(log_entry, cert_hash, move |index| {
+            sct_builder
+                .create_sct_with_timestamp_and_index(
+                    &cert_der_for_sct,
+                    LogEntryType::X509Entry,
+                    None,
+                    timestamp_ms,
+                    Some(index),
+                )
+                .expect("Failed to create SCT")
+        })
         .await
         .map_err(|e| match e {
             crate::storage::StorageError::QueueFull => (
@@ -362,21 +370,33 @@ pub async fn add_pre_chain(
         timestamp,
     );
 
-    let sct = state
-        .sct_builder
-        .create_sct_with_timestamp(
-            &tbs_certificate,
-            LogEntryType::PrecertEntry,
-            Some(&issuer_key_hash),
-            timestamp_ms,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(e.into())))?;
+    let sct_builder = state.sct_builder.clone();
+    let tbs_cert_for_sct = tbs_certificate.clone();
+    let issuer_key_hash_for_sct = issuer_key_hash.clone();
 
-    let _assigned_index = state
+    let (_assigned_index, sct) = state
         .storage
-        .add_entry_batched(log_entry, cert_hash, sct.clone())
+        .add_entry_batched(log_entry, cert_hash, move |index| {
+            sct_builder
+                .create_sct_with_timestamp_and_index(
+                    &tbs_cert_for_sct,
+                    LogEntryType::PrecertEntry,
+                    Some(&issuer_key_hash_for_sct),
+                    timestamp_ms,
+                    Some(index),
+                )
+                .expect("Failed to create SCT")
+        })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(e.into())))?;
+        .map_err(|e| match e {
+            crate::storage::StorageError::QueueFull => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Service temporarily unavailable - system at capacity".to_string(),
+                }),
+            ),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(e.into())),
+        })?;
 
     let response = AddChainResponse {
         sct_version: sct.version as u8,

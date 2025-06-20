@@ -48,6 +48,7 @@ csv = "1.3"
 reqwest = { version = "0.12", features = ["rustls-tls"] }
 prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
+flate2 = "1.1"
 
 [dev-dependencies]
 subtle = "2.5"

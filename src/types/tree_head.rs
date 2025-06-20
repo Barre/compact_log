@@ -1,3 +1,4 @@
+use crate::types::signed_note::{CheckpointBuilder, SignedNote};
 use crate::types::{CtError, Result};
 use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -90,13 +91,19 @@ pub struct SthResponse {
 
 pub struct SthBuilder {
     signing_key: SigningKey,
+    origin: String,
+    log_id: Vec<u8>,
 }
 
 impl SthBuilder {
-    pub fn from_private_key_bytes(private_key_bytes: &[u8]) -> Result<Self> {
+    pub fn new(private_key_bytes: &[u8], origin: String, log_id: Vec<u8>) -> Result<Self> {
         let signing_key = SigningKey::from_slice(private_key_bytes)
             .map_err(|_| CtError::InvalidCertificate("Invalid private key".into()))?;
-        Ok(Self { signing_key })
+        Ok(Self {
+            signing_key,
+            origin,
+            log_id,
+        })
     }
 
     pub fn create_sth(
@@ -115,6 +122,25 @@ impl SthBuilder {
         sth.signature = signature.to_bytes().to_vec();
 
         Ok(sth)
+    }
+
+    /// Create a signed checkpoint following the C2SP specification
+    pub fn create_checkpoint(
+        &self,
+        tree_size: u64,
+        root_hash: Vec<u8>,
+        checkpoint_timestamp: Option<u64>,
+    ) -> Result<SignedNote> {
+        let timestamp =
+            checkpoint_timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+        let checkpoint_builder = CheckpointBuilder::new(
+            self.signing_key.clone(),
+            self.origin.clone(),
+            self.log_id.clone(),
+        );
+
+        checkpoint_builder.create_checkpoint(tree_size, &root_hash, timestamp)
     }
 }
 
@@ -230,16 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sth_builder_from_private_key_bytes() {
+    fn test_sth_builder_new() {
         let (signing_key, _) = create_test_key_pair();
         let private_key_bytes = signing_key.to_bytes();
+        let origin = "example.com/test-log".to_string();
+        let log_id = vec![0u8; 32];
 
-        let builder = SthBuilder::from_private_key_bytes(&private_key_bytes);
+        let builder = SthBuilder::new(&private_key_bytes, origin.clone(), log_id.clone());
         assert!(builder.is_ok());
 
         // Test with invalid key bytes
         let invalid_key = vec![0x00; 16]; // Too short
-        let builder_err = SthBuilder::from_private_key_bytes(&invalid_key);
+        let builder_err = SthBuilder::new(&invalid_key, origin, log_id);
         assert!(builder_err.is_err());
     }
 
@@ -247,8 +275,10 @@ mod tests {
     fn test_create_sth_with_timestamp() {
         let (signing_key, verifying_key) = create_test_key_pair();
         let private_key_bytes = signing_key.to_bytes();
+        let origin = "example.com/test-log".to_string();
+        let log_id = vec![0u8; 32];
 
-        let builder = SthBuilder::from_private_key_bytes(&private_key_bytes).unwrap();
+        let builder = SthBuilder::new(&private_key_bytes, origin, log_id).unwrap();
 
         let tree_size = 1000u64;
         let root_hash = create_test_root_hash();
@@ -275,8 +305,10 @@ mod tests {
     fn test_create_sth_without_timestamp() {
         let (signing_key, verifying_key) = create_test_key_pair();
         let private_key_bytes = signing_key.to_bytes();
+        let origin = "example.com/test-log".to_string();
+        let log_id = vec![0u8; 32];
 
-        let builder = SthBuilder::from_private_key_bytes(&private_key_bytes).unwrap();
+        let builder = SthBuilder::new(&private_key_bytes, origin, log_id).unwrap();
 
         let tree_size = 1000u64;
         let root_hash = create_test_root_hash();
@@ -302,8 +334,10 @@ mod tests {
     fn test_sth_signature_is_der_format() {
         let (signing_key, _) = create_test_key_pair();
         let private_key_bytes = signing_key.to_bytes();
+        let origin = "example.com/test-log".to_string();
+        let log_id = vec![0u8; 32];
 
-        let builder = SthBuilder::from_private_key_bytes(&private_key_bytes).unwrap();
+        let builder = SthBuilder::new(&private_key_bytes, origin, log_id).unwrap();
 
         let tree_size = 100u64;
         let root_hash = create_test_root_hash();

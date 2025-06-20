@@ -43,12 +43,11 @@ impl From<slatedb::SlateDBError> for StorageError {
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Entry to be batched and flushed
-#[derive(Debug)]
 pub struct BatchEntry {
     pub log_entry: LogEntry,
     pub cert_hash: [u8; 32],
-    pub sct: SignedCertificateTimestamp,
-    pub completion_tx: oneshot::Sender<Result<u64>>,
+    pub sct_callback: Box<dyn FnOnce(u64) -> SignedCertificateTimestamp + Send>,
+    pub completion_tx: oneshot::Sender<Result<(u64, SignedCertificateTimestamp)>>,
 }
 
 /// Certificate SCT mapping entry for deduplication
@@ -144,19 +143,22 @@ impl CtStorage {
         Ok(Self { db, batch_sender })
     }
 
-    /// Add entry to batch queue and return assigned index
-    pub async fn add_entry_batched(
+    /// Add entry to batch queue and return assigned index and SCT
+    pub async fn add_entry_batched<F>(
         &self,
         log_entry: LogEntry,
         cert_hash: [u8; 32],
-        sct: SignedCertificateTimestamp,
-    ) -> Result<u64> {
+        sct_callback: F,
+    ) -> Result<(u64, SignedCertificateTimestamp)>
+    where
+        F: FnOnce(u64) -> SignedCertificateTimestamp + Send + 'static,
+    {
         let (completion_tx, completion_rx) = oneshot::channel();
 
         let batch_entry = BatchEntry {
             log_entry,
             cert_hash,
-            sct,
+            sct_callback: Box::new(sct_callback),
             completion_tx,
         };
 
@@ -185,24 +187,10 @@ impl CtStorage {
             },
         }
 
-        let index = completion_rx.await.map_err(|_| {
+        completion_rx.await.map_err(|_| {
             tracing::error!("add_entry_batched: Completion channel closed");
             StorageError::InvalidFormat("Batch completion channel closed".into())
-        })?;
-
-        match index {
-            Ok(idx) => {
-                tracing::trace!(
-                    "add_entry_batched: Received completion result with index {}",
-                    idx
-                );
-                Ok(idx)
-            }
-            Err(e) => {
-                tracing::error!("add_entry_batched: Received completion error");
-                Err(e)
-            }
-        }
+        })?
     }
 
     /// Background worker that batches and flushes entries
@@ -296,6 +284,13 @@ impl CtStorage {
             SignedCertificateTimestamp,
             LogEntry,
         )> = Vec::new();
+
+        // Store completion info separately
+        #[allow(clippy::type_complexity)]
+        let mut completion_info: Vec<(
+            oneshot::Sender<Result<(u64, SignedCertificateTimestamp)>>,
+            Option<SignedCertificateTimestamp>,
+        )> = Vec::new();
         let mut failed_entries = Vec::new();
 
         // Deduplication tracking variables
@@ -305,11 +300,63 @@ impl CtStorage {
         let mut total_certs_in_batch = 0usize;
         let mut total_certs_skipped = 0usize;
 
+        // Get the starting index first to assign indices
+        let starting_index = match merkle_tree.size().await {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::error!("Failed to get tree size: {:?}", e);
+                for entry in entries.drain(..) {
+                    let _ = entry
+                        .completion_tx
+                        .send(Err(StorageError::InvalidFormat(format!(
+                            "Failed to get tree size: {:?}",
+                            e
+                        ))));
+                }
+                return;
+            }
+        };
+
         tracing::trace!(
             "Elapsed time before processing entries: {:?}",
             start_time.elapsed()
         );
-        for (i, entry) in entries.iter().enumerate() {
+
+        // Process entries and generate SCTs with assigned indices
+        for (i, mut entry) in entries.drain(..).enumerate() {
+            let assigned_index = starting_index + i as u64;
+
+            // Update the log entry with the assigned index
+            entry.log_entry.index = assigned_index;
+
+            // Generate SCT with the assigned index
+            let sct = (entry.sct_callback)(assigned_index);
+
+            // Regenerate leaf_data with the assigned index
+            let leaf_data_with_index = LogEntry::compute_leaf_data_with_index(
+                &entry.log_entry.certificate,
+                entry.log_entry.entry_type,
+                entry.log_entry.issuer_key_hash.as_deref(),
+                entry.log_entry.timestamp,
+                assigned_index,
+            );
+
+            // Update the leaf_data in the entry to match what we're storing in the merkle tree
+            entry.log_entry.leaf_data = leaf_data_with_index.clone();
+
+            // Debug: print the hash for the first entry
+            if assigned_index == 0 {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update([0x00]);
+                hasher.update(&leaf_data_with_index);
+                let hash = hasher.finalize();
+                println!(
+                    "DEBUG: Pushing entry 0 to merkle tree with hash: {}",
+                    hex::encode(hash)
+                );
+            }
+
             let dedup_entry = DeduplicatedLogEntry::from_log_entry(&entry.log_entry);
 
             match postcard::to_stdvec(&dedup_entry) {
@@ -318,16 +365,19 @@ impl CtStorage {
                         i,
                         entry_data,
                         entry.cert_hash,
-                        entry.sct.clone(),
+                        sct.clone(),
                         entry.log_entry.clone(), // Keep original for certificate storage
                     ));
-                    leaf_data_vec.push(entry.log_entry.leaf_data.clone());
+                    leaf_data_vec.push(leaf_data_with_index);
+                    completion_info.push((entry.completion_tx, Some(sct)));
                 }
                 Err(e) => {
                     failed_entries.push((i, StorageError::InvalidFormat(e.to_string())));
+                    completion_info.push((entry.completion_tx, None));
                 }
             }
         }
+
         tracing::trace!(
             "Elapsed time after processing entries: {:?}",
             start_time.elapsed(),
@@ -340,19 +390,6 @@ impl CtStorage {
             );
 
             // Build the additional data that needs to be written atomically with the tree
-            let starting_index =
-                match merkle_tree.size().await {
-                    Ok(size) => size,
-                    Err(e) => {
-                        tracing::error!("Failed to get tree size: {:?}", e);
-                        for entry in entries.drain(..) {
-                            let _ = entry.completion_tx.send(Err(StorageError::InvalidFormat(
-                                format!("Failed to get tree size: {:?}", e),
-                            )));
-                        }
-                        return;
-                    }
-                };
 
             // Collect all unique certificate hashes to check
             cert_hashes_to_check.clear();
@@ -503,6 +540,16 @@ impl CtStorage {
                 }
             }
 
+            // Precompute subtree roots for static API for the range we're about to add
+            let end_index = starting_index + batch_size as u64;
+            let precomputed_subtree_roots = merkle_tree
+                .precompute_tile_subtree_roots_for_range(starting_index, end_index)
+                .await
+                .expect("Precomputing tile subtree roots should never fail");
+
+            // Add precomputed subtree roots to additional_data
+            additional_data.extend(precomputed_subtree_roots);
+
             tracing::trace!("Elapsed time before batch push: {:?}", start_time.elapsed());
             match merkle_tree
                 .batch_push_with_data(leaf_data_vec, additional_data)
@@ -528,33 +575,37 @@ impl CtStorage {
 
         // Notify all entries with their results
         match push_result {
-            Ok(starting_index) => {
+            Ok(_) => {
                 let mut valid_idx = 0;
-                for (i, entry) in entries.drain(..).enumerate() {
+                for (i, (tx, sct_opt)) in completion_info.into_iter().enumerate() {
                     if let Some((_, error)) = failed_entries.iter().find(|(idx, _)| *idx == i) {
                         tracing::info!(
                             "flush_batch: Notifying entry {} with serialization error",
                             i
                         );
-                        let _ = entry.completion_tx.send(Err(error.clone()));
-                    } else {
+                        let _ = tx.send(Err(error.clone()));
+                    } else if let Some(sct) = sct_opt {
                         let assigned_index = starting_index + valid_idx;
                         valid_idx += 1;
                         tracing::trace!(
-                            "flush_batch: Notifying entry {} with assigned index {}",
+                            "flush_batch: Notifying entry {} with assigned index {} and SCT",
                             i,
                             assigned_index
                         );
-                        let _ = entry.completion_tx.send(Ok(assigned_index));
+                        let _ = tx.send(Ok((assigned_index, sct)));
+                    } else {
+                        // This shouldn't happen as failed entries are already handled above
+                        let _ =
+                            tx.send(Err(StorageError::InvalidFormat("Unexpected error".into())));
                     }
                 }
             }
             Err(ref e) => {
-                for (i, entry) in entries.drain(..).enumerate() {
+                for (i, (tx, _)) in completion_info.into_iter().enumerate() {
                     if let Some((_, error)) = failed_entries.iter().find(|(idx, _)| *idx == i) {
-                        let _ = entry.completion_tx.send(Err(error.clone()));
+                        let _ = tx.send(Err(error.clone()));
                     } else {
-                        let _ = entry.completion_tx.send(Err(e.clone()));
+                        let _ = tx.send(Err(e.clone()));
                     }
                 }
             }
@@ -1027,8 +1078,8 @@ mod tests {
         let log_id = create_test_log_id();
         let sct = create_test_sct(log_id, 1234567890000);
 
-        let index = storage
-            .add_entry_batched(log_entry.clone(), cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(log_entry.clone(), cert_hash, move |_| sct)
             .await
             .unwrap();
         assert_eq!(index, 0);
@@ -1052,8 +1103,8 @@ mod tests {
         let log_id = create_test_log_id();
         let sct = create_test_sct(log_id, 1234567890000);
 
-        let index = storage
-            .add_entry_batched(log_entry.clone(), cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(log_entry.clone(), cert_hash, move |_| sct)
             .await
             .unwrap();
 
@@ -1105,8 +1156,9 @@ mod tests {
 
             let handle: tokio::task::JoinHandle<Result<u64>> = tokio::spawn(async move {
                 storage_clone
-                    .add_entry_batched(log_entry, cert_hash, sct)
+                    .add_entry_batched(log_entry, cert_hash, move |_| sct)
                     .await
+                    .map(|(idx, _)| idx)
             });
             handles.push(handle);
         }
@@ -1142,8 +1194,8 @@ mod tests {
         let sct = create_test_sct(log_id, 1234567890000);
 
         // Add single entry
-        let index = storage
-            .add_entry_batched(log_entry, cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(log_entry, cert_hash, move |_| sct)
             .await
             .unwrap();
         assert_eq!(index, 0);
@@ -1178,12 +1230,12 @@ mod tests {
         let sct2 = create_test_sct(log_id.clone(), timestamp2.timestamp_millis() as u64);
 
         // Add both entries
-        let index1 = storage
-            .add_entry_batched(entry1, cert_hash, sct1.clone())
+        let (index1, _sct1) = storage
+            .add_entry_batched(entry1, cert_hash, move |_| sct1)
             .await
             .unwrap();
-        let index2 = storage
-            .add_entry_batched(entry2, cert_hash, sct2.clone())
+        let (index2, _sct2) = storage
+            .add_entry_batched(entry2, cert_hash, move |_| sct2)
             .await
             .unwrap();
 
@@ -1214,16 +1266,23 @@ mod tests {
         let sct = create_test_sct(log_id, 1234567890000);
 
         // Add entry
-        let index = storage
-            .add_entry_batched(log_entry.clone(), cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(log_entry.clone(), cert_hash, move |_| sct)
             .await
             .unwrap();
 
-        // Calculate leaf hash
+        // Calculate leaf hash with the assigned index
         use sha2::{Digest, Sha256};
+        let leaf_data_with_index = LogEntry::compute_leaf_data_with_index(
+            &log_entry.certificate,
+            log_entry.entry_type,
+            log_entry.issuer_key_hash.as_deref(),
+            log_entry.timestamp,
+            index,
+        );
         let mut hasher = Sha256::new();
         hasher.update([0x00]); // Leaf prefix
-        hasher.update(&log_entry.leaf_data);
+        hasher.update(&leaf_data_with_index);
         let leaf_hash = hasher.finalize();
 
         // Find index by hash
@@ -1251,7 +1310,7 @@ mod tests {
 
         // Add entry
         storage
-            .add_entry_batched(log_entry.clone(), cert_hash, sct)
+            .add_entry_batched(log_entry.clone(), cert_hash, move |_| sct)
             .await
             .unwrap();
 
@@ -1274,8 +1333,8 @@ mod tests {
         let log_id = create_test_log_id();
         let sct = create_test_sct(log_id, log_entry.timestamp.timestamp_millis() as u64);
 
-        let index = storage
-            .add_entry_batched(log_entry.clone(), cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(log_entry.clone(), cert_hash, move |_| sct)
             .await
             .unwrap();
 
@@ -1368,7 +1427,10 @@ mod tests {
             let sct = create_test_sct(log_id.clone(), timestamp.timestamp_millis() as u64);
 
             let handle: tokio::task::JoinHandle<Result<u64>> = tokio::spawn(async move {
-                storage_clone.add_entry_batched(entry, cert_hash, sct).await
+                storage_clone
+                    .add_entry_batched(entry, cert_hash, move |_| sct)
+                    .await
+                    .map(|(idx, _)| idx)
             });
             handles.push(handle);
         }
@@ -1417,7 +1479,10 @@ mod tests {
             let sct = create_test_sct(log_id.clone(), timestamp.timestamp_millis() as u64);
 
             let handle: tokio::task::JoinHandle<Result<u64>> = tokio::spawn(async move {
-                storage_clone.add_entry_batched(entry, cert_hash, sct).await
+                storage_clone
+                    .add_entry_batched(entry, cert_hash, move |_| sct)
+                    .await
+                    .map(|(idx, _)| idx)
             });
             handles.push(handle);
         }
@@ -1461,9 +1526,10 @@ mod tests {
         let timestamp1 = Utc.timestamp_millis_opt(1234567890000).unwrap();
         let entry1 = LogEntry::new_with_timestamp(0, certificate.clone(), None, timestamp1);
         let sct1 = create_test_sct(log_id.clone(), timestamp1.timestamp_millis() as u64);
+        let sct1_timestamp = sct1.timestamp;
 
-        let index1 = storage
-            .add_entry_batched(entry1, cert_hash, sct1.clone())
+        let (index1, _sct1) = storage
+            .add_entry_batched(entry1, cert_hash, move |_| sct1)
             .await
             .unwrap();
 
@@ -1474,7 +1540,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sct_entry1.index, index1);
-        assert_eq!(sct_entry1.timestamp, sct1.timestamp);
+        assert_eq!(sct_entry1.timestamp, sct1_timestamp);
 
         // Add second entry with same certificate but different SCT
         let timestamp2 = Utc.timestamp_millis_opt(1234567891000).unwrap();
@@ -1486,9 +1552,10 @@ mod tests {
             extensions: vec![0xff],            // Different extensions
             signature: vec![0xdd, 0xee, 0xff], // Different signature
         };
+        let sct2_timestamp = sct2.timestamp;
 
-        let index2 = storage
-            .add_entry_batched(entry2, cert_hash, sct2.clone())
+        let (index2, _sct2) = storage
+            .add_entry_batched(entry2, cert_hash, move |_| sct2)
             .await
             .unwrap();
 
@@ -1499,7 +1566,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sct_entry2.index, index2);
-        assert_eq!(sct_entry2.timestamp, sct2.timestamp);
+        assert_eq!(sct_entry2.timestamp, sct2_timestamp);
 
         // Both log entries should exist
         let retrieved1 = storage.get_entry(index1).await.unwrap().unwrap();
@@ -1527,8 +1594,8 @@ mod tests {
         let sct = create_test_sct(log_id, timestamp.timestamp_millis() as u64);
 
         // Add entry
-        let index = storage
-            .add_entry_batched(entry, cert_hash, sct)
+        let (index, _sct) = storage
+            .add_entry_batched(entry, cert_hash, move |_| sct)
             .await
             .unwrap();
 
@@ -1645,12 +1712,12 @@ mod tests {
         let sct1 = create_test_sct(log_id.clone(), timestamp1.timestamp_millis() as u64);
         let sct2 = create_test_sct(log_id.clone(), timestamp2.timestamp_millis() as u64);
 
-        let index1 = storage
-            .add_entry_batched(entry1, cert_hash1, sct1)
+        let (index1, _sct1) = storage
+            .add_entry_batched(entry1, cert_hash1, move |_| sct1)
             .await
             .unwrap();
-        let index2 = storage
-            .add_entry_batched(entry2, cert_hash2, sct2)
+        let (index2, _sct2) = storage
+            .add_entry_batched(entry2, cert_hash2, move |_| sct2)
             .await
             .unwrap();
 

@@ -216,6 +216,42 @@ impl StorageBackedMerkleTree {
             )))
         })
     }
+
+    /// Get the hash of an internal node at the given index for a specific tree version
+    pub async fn get_node_hash_at_version(
+        &self,
+        node_index: u64,
+        version: u64,
+    ) -> Result<digest::Output<Sha256>> {
+        self.tree
+            .get_node_hash_at_version(node_index, version)
+            .await
+            .map_err(|e| {
+                CtError::Storage(crate::storage::StorageError::InvalidFormat(format!(
+                    "Failed to get node hash at version: {:?}",
+                    e
+                )))
+            })
+    }
+
+    /// Precompute and store subtree roots for efficient static API tile generation
+    /// This computes subtree roots only for the range of entries specified
+    /// Returns a vector of (key, value) pairs to be included in the batch write
+    pub async fn precompute_tile_subtree_roots_for_range(
+        &self,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        (*self.tree)
+            .precompute_tile_subtree_roots_for_range(start_index, end_index)
+            .await
+            .map_err(|e| {
+                CtError::Storage(crate::storage::StorageError::InvalidFormat(format!(
+                    "Failed to precompute tile subtree roots: {:?}",
+                    e
+                )))
+            })
+    }
 }
 
 pub mod serialization {

@@ -7,6 +7,9 @@ use thiserror::Error;
 use x509_cert::Certificate;
 
 pub mod sct;
+pub mod sct_extensions;
+pub mod signed_note;
+pub mod tiles;
 pub mod tree_head;
 
 /// Log entry type according to RFC 6962
@@ -46,6 +49,10 @@ impl LogId {
         let mut id = [0u8; 32];
         id.copy_from_slice(&hash);
         Self(id)
+    }
+
+    pub fn to_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -220,6 +227,7 @@ impl LogEntry {
         entry_type: LogEntryType,
         issuer_key_hash: Option<&[u8]>,
         timestamp: DateTime<Utc>,
+        index: Option<u64>,
     ) -> Vec<u8> {
         let mut data = Vec::new();
 
@@ -269,8 +277,23 @@ impl LogEntry {
             }
         }
 
-        // Extensions length (2 bytes) - no extensions for now
-        data.extend_from_slice(&[0x00, 0x00]);
+        // Extensions
+        if let Some(idx) = index {
+            // Extensions length (2 bytes) - leaf_index extension
+            // Extension type (1 byte) + length (2 bytes) + data (5 bytes) = 8 bytes total
+            data.extend_from_slice(&[0x00, 0x08]);
+
+            // Extension type (1 byte) - leaf_index (0)
+            data.push(0x00);
+            // Extension data length (2 bytes) - 5 bytes for 40-bit index
+            data.extend_from_slice(&[0x00, 0x05]);
+            // LeafIndex as 40-bit big-endian integer
+            let index_bytes = idx.to_be_bytes();
+            data.extend_from_slice(&index_bytes[3..8]); // Take last 5 bytes for 40-bit value
+        } else {
+            // Extensions length (2 bytes) - no extensions
+            data.extend_from_slice(&[0x00, 0x00]);
+        }
 
         data
     }
@@ -283,9 +306,24 @@ impl LogEntry {
         issuer_key_hash: Option<&[u8]>,
         timestamp: DateTime<Utc>,
     ) -> Vec<u8> {
-        // Note: This returns serialized data, not a hash. The actual leaf hash                                                       │ │
-        // is computed as SHA256(0x00 || this_data) in the storage layer
-        Self::serialize_merkle_tree_leaf(certificate, entry_type, issuer_key_hash, timestamp)
+        Self::serialize_merkle_tree_leaf(certificate, entry_type, issuer_key_hash, timestamp, None)
+    }
+
+    /// Compute leaf data with a specific index (for regenerating after index assignment)
+    pub fn compute_leaf_data_with_index(
+        certificate: &[u8],
+        entry_type: LogEntryType,
+        issuer_key_hash: Option<&[u8]>,
+        timestamp: DateTime<Utc>,
+        index: u64,
+    ) -> Vec<u8> {
+        Self::serialize_merkle_tree_leaf(
+            certificate,
+            entry_type,
+            issuer_key_hash,
+            timestamp,
+            Some(index),
+        )
     }
 
     /// Check if a certificate is a pre-certificate by looking for the poison extension
@@ -325,6 +363,7 @@ impl LogEntry {
             self.entry_type,
             issuer_key_hash,
             self.timestamp,
+            Some(self.index),
         );
 
         Ok(data)
@@ -649,8 +688,13 @@ mod tests {
         let cert = vec![0x01, 0x02, 0x03, 0x04];
         let timestamp = create_test_timestamp();
 
-        let leaf_data =
-            LogEntry::serialize_merkle_tree_leaf(&cert, LogEntryType::X509Entry, None, timestamp);
+        let leaf_data = LogEntry::serialize_merkle_tree_leaf(
+            &cert,
+            LogEntryType::X509Entry,
+            None,
+            timestamp,
+            None,
+        );
 
         // Check structure
         assert_eq!(leaf_data[0], 0x00); // Version
@@ -685,6 +729,7 @@ mod tests {
             LogEntryType::PrecertEntry,
             Some(&issuer_key_hash),
             timestamp,
+            None,
         );
 
         // Check structure
@@ -710,6 +755,57 @@ mod tests {
 
         // Extensions length (2 bytes)
         assert_eq!(&leaf_data[51..53], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_serialize_merkle_tree_leaf_with_index() {
+        let cert = vec![0x01, 0x02, 0x03, 0x04];
+        let timestamp = create_test_timestamp();
+        let leaf_index = 12345u64;
+
+        let leaf_data = LogEntry::serialize_merkle_tree_leaf(
+            &cert,
+            LogEntryType::X509Entry,
+            None,
+            timestamp,
+            Some(leaf_index),
+        );
+
+        // Check structure
+        assert_eq!(leaf_data[0], 0x00); // Version
+        assert_eq!(leaf_data[1], 0x00); // LeafType (timestamped_entry)
+
+        // Timestamp (8 bytes)
+        let ts_bytes = &leaf_data[2..10];
+        let ts_value = u64::from_be_bytes(ts_bytes.try_into().unwrap());
+        assert_eq!(ts_value, 1234567890000);
+
+        // LogEntryType (2 bytes)
+        assert_eq!(&leaf_data[10..12], &[0x00, 0x00]); // X509Entry
+
+        // Certificate length (3 bytes)
+        assert_eq!(&leaf_data[12..15], &[0x00, 0x00, 0x04]);
+
+        // Certificate data
+        assert_eq!(&leaf_data[15..19], &[0x01, 0x02, 0x03, 0x04]);
+
+        // Extensions length (2 bytes) - should be 8 for leaf_index extension
+        assert_eq!(&leaf_data[19..21], &[0x00, 0x08]); // 8 bytes
+
+        // Extension data (directly, no length prefix in MerkleTreeLeaf)
+        let extensions = &leaf_data[21..29];
+        // Extension type
+        assert_eq!(extensions[0], 0x00); // leaf_index
+                                         // Extension data length
+        assert_eq!(&extensions[1..3], &[0x00, 0x05]); // 5 bytes
+                                                      // Leaf index value (40-bit big-endian)
+        let encoded_index = &extensions[3..8];
+        let decoded_index = ((encoded_index[0] as u64) << 32)
+            | ((encoded_index[1] as u64) << 24)
+            | ((encoded_index[2] as u64) << 16)
+            | ((encoded_index[3] as u64) << 8)
+            | (encoded_index[4] as u64);
+        assert_eq!(decoded_index, leaf_index);
     }
 
     #[test]

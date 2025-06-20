@@ -1,3 +1,4 @@
+use crate::types::sct_extensions::CtExtensions;
 use crate::types::{CtError, LogEntryType, LogId, Result};
 use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -131,6 +132,7 @@ impl SctBuilder {
     }
 
     /// Create and sign an SCT for a certificate with a specific timestamp
+    #[cfg(test)]
     pub fn create_sct_with_timestamp(
         &self,
         certificate: &[u8],
@@ -138,7 +140,32 @@ impl SctBuilder {
         issuer_key_hash: Option<&[u8]>,
         timestamp: u64,
     ) -> Result<SignedCertificateTimestamp> {
+        self.create_sct_with_timestamp_and_index(
+            certificate,
+            entry_type,
+            issuer_key_hash,
+            timestamp,
+            None,
+        )
+    }
+
+    /// Create and sign an SCT for a certificate with a specific timestamp and optional index
+    pub fn create_sct_with_timestamp_and_index(
+        &self,
+        certificate: &[u8],
+        entry_type: LogEntryType,
+        issuer_key_hash: Option<&[u8]>,
+        timestamp: u64,
+        index: Option<u64>,
+    ) -> Result<SignedCertificateTimestamp> {
         let mut sct = SignedCertificateTimestamp::new(self.log_id.clone(), timestamp);
+
+        // Add leaf_index extension if provided
+        if let Some(idx) = index {
+            sct.extensions = CtExtensions::with_leaf_index(idx).map_err(|e| {
+                CtError::Internal(format!("Failed to create leaf_index extension: {}", e))
+            })?;
+        }
 
         let signature_input = sct.get_signature_input(certificate, entry_type, issuer_key_hash);
 
@@ -466,5 +493,154 @@ mod tests {
             "DER signature should be longer than raw format"
         );
         assert!(sig_bytes.len() <= 72, "DER signature shouldn't be too long");
+    }
+
+    #[test]
+    fn test_create_sct_with_leaf_index_extension() {
+        let (signing_key, verifying_key) = create_test_key_pair();
+        let log_id = create_test_log_id();
+        let private_key_bytes = signing_key.to_bytes();
+
+        let builder =
+            SctBuilder::from_private_key_bytes(log_id.clone(), &private_key_bytes).unwrap();
+
+        let certificate = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let timestamp = 1234567890000u64;
+        let leaf_index = 12345u64;
+
+        let sct = builder
+            .create_sct_with_timestamp_and_index(
+                &certificate,
+                LogEntryType::X509Entry,
+                None,
+                timestamp,
+                Some(leaf_index),
+            )
+            .unwrap();
+
+        // Verify SCT fields
+        assert_eq!(sct.version, SctVersion::V1);
+        assert_eq!(sct.log_id, log_id);
+        assert_eq!(sct.timestamp, timestamp);
+
+        // Verify extensions are present and have correct length
+        // According to spec: 2 bytes length + 1 byte type + 2 bytes data length + 5 bytes leaf index = 10 bytes total
+        assert_eq!(sct.extensions.len(), 10);
+
+        // Verify extension structure
+        assert_eq!(&sct.extensions[0..2], &[0, 8]); // Total extensions length = 8
+        assert_eq!(sct.extensions[2], 0); // Extension type = leaf_index (0)
+        assert_eq!(&sct.extensions[3..5], &[0, 5]); // Extension data length = 5
+
+        // Verify leaf index encoding (big-endian 40-bit)
+        let encoded_index = &sct.extensions[5..10];
+        let decoded_index = ((encoded_index[0] as u64) << 32)
+            | ((encoded_index[1] as u64) << 24)
+            | ((encoded_index[2] as u64) << 16)
+            | ((encoded_index[3] as u64) << 8)
+            | (encoded_index[4] as u64);
+        assert_eq!(decoded_index, leaf_index);
+
+        // Verify the signature is valid with the extensions
+        let signature_input = sct.get_signature_input(&certificate, LogEntryType::X509Entry, None);
+        let sig_bytes = &sct.signature[4..];
+        let signature = DerSignature::from_bytes(sig_bytes).unwrap();
+        assert!(verifying_key.verify(&signature_input, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_create_sct_with_max_leaf_index() {
+        let (signing_key, _) = create_test_key_pair();
+        let log_id = create_test_log_id();
+        let private_key_bytes = signing_key.to_bytes();
+
+        let builder = SctBuilder::from_private_key_bytes(log_id, &private_key_bytes).unwrap();
+
+        let certificate = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let timestamp = 1234567890000u64;
+        let max_leaf_index = 0xFFFFFFFFFF_u64; // Maximum 40-bit value
+
+        let sct = builder
+            .create_sct_with_timestamp_and_index(
+                &certificate,
+                LogEntryType::X509Entry,
+                None,
+                timestamp,
+                Some(max_leaf_index),
+            )
+            .unwrap();
+
+        // Verify the max index is encoded correctly
+        let encoded_index = &sct.extensions[5..10];
+        assert_eq!(encoded_index, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_create_sct_without_index_has_empty_extensions() {
+        let (signing_key, _) = create_test_key_pair();
+        let log_id = create_test_log_id();
+        let private_key_bytes = signing_key.to_bytes();
+
+        let builder = SctBuilder::from_private_key_bytes(log_id, &private_key_bytes).unwrap();
+
+        let certificate = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let timestamp = 1234567890000u64;
+
+        let sct = builder
+            .create_sct_with_timestamp_and_index(
+                &certificate,
+                LogEntryType::X509Entry,
+                None,
+                timestamp,
+                None, // No index provided
+            )
+            .unwrap();
+
+        // Extensions should be empty when no index is provided
+        assert!(sct.extensions.is_empty());
+    }
+
+    #[test]
+    fn test_sct_with_precert_and_leaf_index() {
+        let (signing_key, verifying_key) = create_test_key_pair();
+        let log_id = create_test_log_id();
+        let private_key_bytes = signing_key.to_bytes();
+
+        let builder = SctBuilder::from_private_key_bytes(log_id, &private_key_bytes).unwrap();
+
+        let certificate = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let issuer_key_hash = vec![0xbb; 32];
+        let timestamp = 1234567890000u64;
+        let leaf_index = 54321u64;
+
+        let sct = builder
+            .create_sct_with_timestamp_and_index(
+                &certificate,
+                LogEntryType::PrecertEntry,
+                Some(&issuer_key_hash),
+                timestamp,
+                Some(leaf_index),
+            )
+            .unwrap();
+
+        // Verify the signature with extensions
+        let signature_input = sct.get_signature_input(
+            &certificate,
+            LogEntryType::PrecertEntry,
+            Some(&issuer_key_hash),
+        );
+        let sig_bytes = &sct.signature[4..];
+        let signature = DerSignature::from_bytes(sig_bytes).unwrap();
+
+        assert!(verifying_key.verify(&signature_input, &signature).is_ok());
+
+        // Verify leaf index in extensions
+        let encoded_index = &sct.extensions[5..10];
+        let decoded_index = ((encoded_index[0] as u64) << 32)
+            | ((encoded_index[1] as u64) << 24)
+            | ((encoded_index[2] as u64) << 16)
+            | ((encoded_index[3] as u64) << 8)
+            | (encoded_index[4] as u64);
+        assert_eq!(decoded_index, leaf_index);
     }
 }
